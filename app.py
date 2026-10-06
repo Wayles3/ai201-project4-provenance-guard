@@ -296,3 +296,17 @@ def get_analytics():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "Provenance Guard API",
+        "status": "online",
+        "version": "1.0.0",
+        "endpoints": {
+            "POST /submit": "Submit text content for multi-signal attribution analysis",
+            "POST /appeal": "Submit human review appeal for uncertain classifications",
+            "GET /log": "Fetch immutable provenance audit logs",
+            "GET /analytics/data": "Fetch platform classification aggregate metrics"
+        }
+    }), 200
