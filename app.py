@@ -5,6 +5,9 @@ import datetime
 import math
 import re
 import hashlib
+import hmac
+import random
+import statistics
 from flask import Flask, request, jsonify
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -24,24 +27,41 @@ limiter = Limiter(
 
 DB_PATH = "provenance_guard.db"
 
+def db():
+    return sqlite3.connect(DB_PATH)
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             content_id TEXT PRIMARY KEY,
             creator_id TEXT NOT NULL,
             timestamp TEXT NOT NULL,
+            content_type TEXT NOT NULL DEFAULT 'text',
             attribution TEXT NOT NULL,
             confidence REAL NOT NULL,
             llm_score REAL NOT NULL,
+            llm_available INTEGER NOT NULL DEFAULT 1,
             stylometric_score REAL NOT NULL,
             entropy_score REAL NOT NULL,
+            phrase_score REAL NOT NULL,
             metadata_score REAL NOT NULL,
             status TEXT NOT NULL,
             text_excerpt TEXT NOT NULL,
             certificate_id TEXT,
-            appeal_reasoning TEXT
+            verified_at TEXT,
+            appeal_reasoning TEXT,
+            appealed_at TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS challenges (
+            challenge_id TEXT PRIMARY KEY,
+            content_id TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
         )
     """)
     conn.commit()
@@ -49,11 +69,15 @@ def init_db():
 
 init_db()
 
-def get_llm_signal_score(text: str) -> float:
+# ---------------------------------------------------------------- signals
+# Every signal returns a score in [0, 1] where 1 = looks AI. 0.5 means "no information".
+
+def get_llm_signal_score(text: str):
+    """LLM judge. Returns None when unavailable so the ensemble can drop it."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key or api_key == "gsk_your_actual_groq_api_key_here":
-        return 0.5
-    
+        return None
+
     try:
         client = Groq(api_key=api_key)
         prompt = (
@@ -62,64 +86,105 @@ def get_llm_signal_score(text: str) -> float:
             f"Text: {text}"
         )
         response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=10
+            max_tokens=300,
+            reasoning_effort="low"
         )
         raw_val = response.choices[0].message.content.strip()
-        match = re.search(r"0\.\d+|1\.0|0", raw_val)
+        match = re.search(r"1\.0+|0?\.\d+|[01]", raw_val)
         if match:
-            return float(match.group(0))
-        return 0.5
+            return min(1.0, float(match.group(0)))
+        return None
     except Exception as e:
-        return 0.5
+        print(f"LLM signal failed, dropping it from the ensemble: {e}")
+        return None
+
+INFORMAL_MARKERS = {"i", "my", "me", "we", "noticed", "yeah", "stuff", "walked", "went", "got",
+                    "cool", "ok", "honestly", "kinda", "gonna", "whatever", "lol"}
+
+def _clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
 
 def get_stylometric_signal_score(text: str) -> float:
-    words = re.findall(r'\b\w+\b', text.lower())
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-    
+    """Burstiness (sentence-length variation), informal/first-person words, contractions, lexical variety."""
+    words = re.findall(r"[\w']+", text.lower())
+    sentences = [s for s in re.split(r"[.!?]+", text) if s.strip()]
     if not words:
         return 0.5
-    
-    # Informal / Conversational markers indicate lower probability of AI output
-    informal_markers = ["i", "my", "was", "me", "we", "noticed", "yeah", "stuff", "walked", "went", "got", "cool"]
-    marker_count = sum(1 for w in words if w in informal_markers)
-    informal_ratio = marker_count / len(words)
-    
-    # Type-Token Ratio
-    ttr = len(set(words)) / len(words)
-    
-    # Natural human variance score calculation
-    human_likelihood = (0.6 * informal_ratio) + (0.4 * ttr)
-    ai_stylometric_score = max(0.05, min(0.95, 1.0 - human_likelihood))
-    return round(ai_stylometric_score, 2)
+
+    # Burstiness: humans mix short and long sentences; LLMs are more even. Needs >= 3 sentences.
+    lengths = [len(re.findall(r"[\w']+", s)) for s in sentences]
+    if len(lengths) >= 3 and statistics.mean(lengths) > 0:
+        cv = statistics.pstdev(lengths) / statistics.mean(lengths)
+        burst_ai = _clamp(1.0 - cv / 0.6, 0.1, 0.9)
+    else:
+        burst_ai = 0.5
+
+    # Informal register: first person, slang, contractions
+    informal = sum(1 for w in words if w in INFORMAL_MARKERS or "'" in w)
+    informal_ai = 1.0 - _clamp(informal / len(words) * 6)
+
+    # Type-token ratio is only meaningful on longer samples
+    ttr_ai = 0.5 if len(words) < 60 else _clamp(1.3 - len(set(words)) / len(words), 0.1, 0.9)
+
+    return round(0.4 * burst_ai + 0.4 * informal_ai + 0.2 * ttr_ai, 2)
+
+AI_PHRASES = [
+    "furthermore", "moreover", "in conclusion", "it is important to note", "it is crucial",
+    "plays a crucial role", "in today's", "rapidly evolving", "landscape", "tapestry", "delve",
+    "cornerstone", "holistic", "foster", "leverage", "leveraging", "transformative", "paradigm",
+    "navigate", "unlock", "ultimately", "overall,", "numerous", "enhance", "embrace", "resilient",
+    "seamless", "multifaceted", "testament", "beacon", "realm", "comprehensive", "ensures",
+]
+
+def get_phrase_signal_score(text: str) -> float:
+    """Density of stock LLM phrasing per 100 words. No hits is weak evidence either way (0.25)."""
+    lowered = text.lower()
+    words = len(re.findall(r"[\w']+", lowered))
+    if not words:
+        return 0.5
+    hits = sum(lowered.count(p) for p in AI_PHRASES)
+    density = hits / words * 100
+    return round(_clamp(0.25 + density * 0.12, 0.25, 0.95), 2)
 
 def get_entropy_signal_score(text: str) -> float:
+    """Character entropy. Weak: nearly all normal English falls in the 'organic' band."""
     if not text:
         return 0.5
-    
     prob = [float(text.count(c)) / len(text) for c in set(text)]
-    entropy = -sum([p * math.log2(p) for p in prob])
-    
-    # Organic text typically exhibits non-uniform character entropy
-    if 3.8 <= entropy <= 4.8:
-        return 0.20
-    return 0.70
+    entropy = -sum(p * math.log2(p) for p in prob)
+    return 0.20 if 3.8 <= entropy <= 4.8 else 0.70
 
-def get_metadata_signal_score(metadata: dict) -> float:
+def get_metadata_signal_score(metadata: dict):
+    """Image/structured metadata. Returns None when none was supplied."""
     if not metadata:
-        return 0.5
-    
+        return None
     software = str(metadata.get("software", "")).lower()
-    ai_keywords = ["midjourney", "stable diffusion", "dall-e", "chatgpt", "generative"]
-    
-    if any(kw in software for kw in ai_keywords):
+    ai_keywords = ["midjourney", "stable diffusion", "dall-e", "dalle", "chatgpt", "firefly", "generative"]
+    if metadata.get("ai_generated") is True or any(kw in software for kw in ai_keywords):
         return 0.95
     if metadata.get("camera_model") or metadata.get("exif_data"):
         return 0.10
-    
     return 0.5
+
+# Weighted average over the signals that are available (missing ones are dropped and the rest renormalized).
+WEIGHTS = {"llm": 0.45, "phrase": 0.25, "stylometric": 0.20, "entropy": 0.05, "metadata": 0.15}
+
+def compute_signals(text: str, metadata=None) -> dict:
+    return {
+        "llm": get_llm_signal_score(text),
+        "phrase": get_phrase_signal_score(text),
+        "stylometric": get_stylometric_signal_score(text),
+        "entropy": get_entropy_signal_score(text),
+        "metadata": get_metadata_signal_score(metadata),
+    }
+
+def combine_signals(signals: dict) -> float:
+    avail = {k: v for k, v in signals.items() if v is not None}
+    total = sum(WEIGHTS[k] for k in avail)
+    return round(sum(WEIGHTS[k] * v for k, v in avail.items()) / total, 2)
 
 def resolve_attribution_and_label(confidence: float):
     if confidence >= 0.70:
@@ -142,171 +207,308 @@ def resolve_attribution_and_label(confidence: float):
         )
     return attribution, label
 
-def generate_provenance_certificate(content_id: str, text: str) -> str:
-    payload = f"{content_id}:{text[:50]}"
-    hash_digest = hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
-    return f"PROV-HUMAN-{content_id[:8]}-{hash_digest.upper()}"
+APPEAL_NOTICE = "Under review: the creator has appealed this label and a human reviewer will re-check it."
+BADGE = "Verified Human Credential: Earned via multi-signal organic provenance validation."
 
+# ---------------------------------------------------------------- certificate
+CERT_SECRET = os.getenv("CERT_SECRET", "dev-secret-change-me")
+CHALLENGE_TTL = datetime.timedelta(minutes=15)
+CHALLENGE_PROMPTS = [
+    "Describe the last meal you cooked or ate that you really enjoyed.",
+    "Write about a time something went wrong on your way somewhere.",
+    "Explain how you would teach a friend to do something you're good at.",
+    "Describe a place from your childhood and what you remember about it.",
+]
+MIN_LIVE_WORDS = 40
+
+def make_certificate(content_id: str, creator_id: str, issued_at: str) -> str:
+    msg = f"{content_id}|{creator_id}|{issued_at}".encode()
+    mac = hmac.new(CERT_SECRET.encode(), msg, hashlib.sha256).hexdigest()[:16].upper()
+    return f"PROV-HUMAN-{content_id[:8]}-{mac}"
+
+def now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+# ---------------------------------------------------------------- endpoints
 @app.route("/submit", methods=["POST"])
 @limiter.limit("10 per minute;100 per day")
 def submit_content():
-    data = request.get_json() or {}
-    text = data.get("text", "").strip()
-    creator_id = data.get("creator_id", "").strip()
-    image_metadata = data.get("image_metadata", {})
-    
+    data = request.get_json(silent=True) or {}
+    text = str(data.get("text", "")).strip()
+    creator_id = str(data.get("creator_id", "")).strip()
+    content_type = data.get("content_type", "text")
+    image_metadata = data.get("image_metadata") or {}
+
     if not text or not creator_id:
         return jsonify({"error": "Missing required fields: 'text' and 'creator_id'"}), 400
-    
+    if content_type not in ("text", "image_description"):
+        return jsonify({"error": "content_type must be 'text' or 'image_description'"}), 400
+    if not isinstance(image_metadata, dict):
+        return jsonify({"error": "image_metadata must be an object"}), 400
+
     content_id = str(uuid.uuid4())
-    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    
-    llm_score = get_llm_signal_score(text)
-    sty_score = get_stylometric_signal_score(text)
-    entropy_score = get_entropy_signal_score(text)
-    meta_score = get_metadata_signal_score(image_metadata)
-    
-    if os.getenv("GROQ_API_KEY") and os.getenv("GROQ_API_KEY") != "gsk_your_actual_groq_api_key_here":
-        confidence = round((0.45 * llm_score) + (0.30 * sty_score) + (0.25 * entropy_score), 2)
-    else:
-        # Balanced score distribution without external LLM API key
-        confidence = round((0.55 * sty_score) + (0.45 * entropy_score), 2)
-        
+    signals = compute_signals(text, image_metadata)
+    confidence = combine_signals(signals)
     attribution, label_text = resolve_attribution_and_label(confidence)
-    status = "classified"
-    
-    certificate_id = None
-    if confidence <= 0.30:
-        certificate_id = generate_provenance_certificate(content_id, text)
-    
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO audit_log 
-        (content_id, creator_id, timestamp, attribution, confidence, llm_score, stylometric_score, entropy_score, metadata_score, status, text_excerpt, certificate_id, appeal_reasoning)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (content_id, creator_id, timestamp, attribution, confidence, llm_score, sty_score, entropy_score, meta_score, status, text[:100], certificate_id, None))
+
+    conn = db()
+    conn.execute("""
+        INSERT INTO audit_log
+        (content_id, creator_id, timestamp, content_type, attribution, confidence, llm_score, llm_available,
+         stylometric_score, entropy_score, phrase_score, metadata_score, status, text_excerpt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'classified', ?)
+    """, (content_id, creator_id, now_iso(), content_type, attribution, confidence,
+          signals["llm"] if signals["llm"] is not None else 0.5, int(signals["llm"] is not None),
+          signals["stylometric"], signals["entropy"], signals["phrase"],
+          signals["metadata"] if signals["metadata"] is not None else 0.5, text[:100]))
     conn.commit()
     conn.close()
-    
-    response_payload = {
+
+    payload = {
         "content_id": content_id,
+        "content_type": content_type,
         "attribution": attribution,
         "confidence": confidence,
-        "signals": {
-            "llm_score": llm_score,
-            "stylometric_score": sty_score,
-            "entropy_score": entropy_score,
-            "metadata_score": meta_score
-        },
+        "signals": signals,   # null = signal unavailable and excluded from the score
         "label": label_text,
-        "status": status
+        "status": "classified",
     }
-    
-    if certificate_id:
-        response_payload["provenance_certificate"] = {
-            "certificate_id": certificate_id,
-            "badge": "Verified Human Credential: Earned via multi-signal organic provenance validation."
-        }
-        
-    return jsonify(response_payload), 200
+    if attribution != "likely_ai":
+        payload["verification"] = "Eligible: POST /verify/challenge to earn a Verified Human credential."
+    return jsonify(payload), 200
 
 @app.route("/appeal", methods=["POST"])
 def submit_appeal():
-    data = request.get_json() or {}
-    content_id = data.get("content_id", "").strip()
-    reasoning = data.get("creator_reasoning", "").strip()
-    
+    data = request.get_json(silent=True) or {}
+    content_id = str(data.get("content_id", "")).strip()
+    reasoning = str(data.get("creator_reasoning", "")).strip()
+
     if not content_id or not reasoning:
         return jsonify({"error": "Missing required fields: 'content_id' and 'creator_reasoning'"}), 400
-    
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT content_id FROM audit_log WHERE content_id = ?", (content_id,))
-    row = cursor.fetchone()
-    
+
+    conn = db()
+    row = conn.execute("SELECT 1 FROM audit_log WHERE content_id = ?", (content_id,)).fetchone()
     if not row:
         conn.close()
         return jsonify({"error": "Content ID not found in audit log."}), 404
-    
-    cursor.execute("""
-        UPDATE audit_log
-        SET status = 'under_review', appeal_reasoning = ?
-        WHERE content_id = ?
-    """, (reasoning, content_id))
+
+    conn.execute("UPDATE audit_log SET status = 'under_review', appeal_reasoning = ?, appealed_at = ? WHERE content_id = ?",
+                 (reasoning, now_iso(), content_id))
     conn.commit()
     conn.close()
-    
     return jsonify({
         "message": "Appeal successfully submitted and recorded.",
         "content_id": content_id,
         "status": "under_review"
     }), 200
 
+@app.route("/verify/challenge", methods=["POST"])
+@limiter.limit("5 per minute")
+def verify_challenge():
+    data = request.get_json(silent=True) or {}
+    content_id = str(data.get("content_id", "")).strip()
+    creator_id = str(data.get("creator_id", "")).strip()
+    if not content_id or not creator_id:
+        return jsonify({"error": "Missing required fields: 'content_id' and 'creator_id'"}), 400
+
+    conn = db()
+    row = conn.execute("SELECT creator_id, attribution, certificate_id FROM audit_log WHERE content_id = ?",
+                       (content_id,)).fetchone()
+    if not row or row[0] != creator_id:
+        conn.close()
+        return jsonify({"error": "Content not found for this creator."}), 404
+    if row[1] == "likely_ai":
+        conn.close()
+        return jsonify({"error": "Content classified likely_ai is not eligible. File an appeal instead."}), 403
+    if row[2]:
+        conn.close()
+        return jsonify({"error": "Content already verified.", "certificate_id": row[2]}), 409
+
+    challenge_id = str(uuid.uuid4())
+    prompt = random.choice(CHALLENGE_PROMPTS)
+    conn.execute("INSERT INTO challenges (challenge_id, content_id, prompt, created_at) VALUES (?, ?, ?, ?)",
+                 (challenge_id, content_id, prompt, now_iso()))
+    conn.commit()
+    conn.close()
+    return jsonify({
+        "challenge_id": challenge_id,
+        "prompt": prompt,
+        "instructions": f"POST /verify with a live writing sample of at least {MIN_LIVE_WORDS} words within 15 minutes.",
+    }), 200
+
+@app.route("/verify", methods=["POST"])
+@limiter.limit("5 per minute")
+def verify_submit():
+    data = request.get_json(silent=True) or {}
+    challenge_id = str(data.get("challenge_id", "")).strip()
+    sample = str(data.get("live_sample", "")).strip()
+    if not challenge_id or not sample:
+        return jsonify({"error": "Missing required fields: 'challenge_id' and 'live_sample'"}), 400
+
+    conn = db()
+    ch = conn.execute("SELECT content_id, created_at, used FROM challenges WHERE challenge_id = ?",
+                      (challenge_id,)).fetchone()
+    if not ch:
+        conn.close()
+        return jsonify({"error": "Unknown challenge."}), 404
+    content_id, created_at, used = ch
+    if used:
+        conn.close()
+        return jsonify({"error": "Challenge already used."}), 409
+    if datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(created_at) > CHALLENGE_TTL:
+        conn.close()
+        return jsonify({"error": "Challenge expired."}), 410
+    if len(re.findall(r"[\w']+", sample)) < MIN_LIVE_WORDS:
+        conn.close()
+        return jsonify({"error": f"Live sample must be at least {MIN_LIVE_WORDS} words."}), 400
+
+    # Single-use whether or not it passes, so a creator can't iterate on one challenge.
+    conn.execute("UPDATE challenges SET used = 1 WHERE challenge_id = ?", (challenge_id,))
+    live_conf = combine_signals(compute_signals(sample))
+    live_attr, _ = resolve_attribution_and_label(live_conf)
+    if live_attr != "likely_human":
+        conn.commit()
+        conn.close()
+        return jsonify({"verified": False, "live_sample_confidence": live_conf,
+                        "message": "Live sample did not read as clearly human. You can request a new challenge."}), 200
+
+    creator_id = conn.execute("SELECT creator_id FROM audit_log WHERE content_id = ?", (content_id,)).fetchone()[0]
+    issued_at = now_iso()
+    cert = make_certificate(content_id, creator_id, issued_at)
+    conn.execute("UPDATE audit_log SET certificate_id = ?, verified_at = ? WHERE content_id = ?",
+                 (cert, issued_at, content_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"verified": True, "live_sample_confidence": live_conf,
+                    "certificate_id": cert, "badge": BADGE}), 200
+
+@app.route("/verify/<certificate_id>", methods=["GET"])
+def verify_certificate(certificate_id):
+    conn = db()
+    row = conn.execute("SELECT content_id, creator_id, verified_at FROM audit_log WHERE certificate_id = ?",
+                       (certificate_id,)).fetchone()
+    conn.close()
+    valid = bool(row) and hmac.compare_digest(make_certificate(row[0], row[1], row[2]), certificate_id)
+    if not valid:
+        return jsonify({"valid": False}), 404
+    return jsonify({"valid": True, "content_id": row[0], "creator_id": row[1], "issued_at": row[2]}), 200
+
+@app.route("/content/<content_id>", methods=["GET"])
+def get_content(content_id):
+    """Public view of how a piece of content is displayed: label, appeal notice, verified badge."""
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM audit_log WHERE content_id = ?", (content_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Content ID not found."}), 404
+    _, label = resolve_attribution_and_label(row["confidence"])
+    view = {
+        "content_id": row["content_id"], "creator_id": row["creator_id"],
+        "content_type": row["content_type"], "attribution": row["attribution"],
+        "confidence": row["confidence"], "label": label, "status": row["status"],
+    }
+    if row["status"] == "under_review":
+        view["appeal_notice"] = APPEAL_NOTICE
+    if row["certificate_id"]:
+        view["badge"] = BADGE
+        view["certificate_id"] = row["certificate_id"]
+    return jsonify(view), 200
+
 @app.route("/log", methods=["GET"])
 def get_audit_log():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 20")
-    rows = cursor.fetchall()
+    rows = conn.execute("SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 20").fetchall()
     conn.close()
-    
-    entries = [dict(row) for row in rows]
-    return jsonify({"entries": entries}), 200
+    return jsonify({"entries": [dict(r) for r in rows]}), 200
 
 @app.route("/analytics/data", methods=["GET"])
 def get_analytics():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT COUNT(*) FROM audit_log")
-    total_submissions = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM audit_log WHERE attribution = 'likely_ai'")
-    ai_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM audit_log WHERE attribution = 'likely_human'")
-    human_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM audit_log WHERE attribution = 'uncertain'")
-    uncertain_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM audit_log WHERE status = 'under_review'")
-    appeals_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT AVG(confidence) FROM audit_log")
-    avg_confidence = cursor.fetchone()[0] or 0.0
-    
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT attribution, confidence, status, certificate_id, llm_score, llm_available, "
+                        "stylometric_score, phrase_score, content_type FROM audit_log").fetchall()
     conn.close()
-    
-    appeal_rate = round((appeals_count / total_submissions * 100), 2) if total_submissions > 0 else 0.0
-    
+
+    total = len(rows)
+    counts = {"likely_ai": 0, "likely_human": 0, "uncertain": 0}
+    buckets = {"0.0-0.2": 0, "0.2-0.4": 0, "0.4-0.6": 0, "0.6-0.8": 0, "0.8-1.0": 0}
+    appeals = verified = disagree = llm_rows = 0
+    types = {}
+    for r in rows:
+        counts[r["attribution"]] += 1
+        buckets[list(buckets)[min(int(r["confidence"] * 5), 4)]] += 1
+        appeals += r["status"] == "under_review"
+        verified += bool(r["certificate_id"])
+        types[r["content_type"]] = types.get(r["content_type"], 0) + 1
+        if r["llm_available"]:
+            llm_rows += 1
+            heuristic = (r["stylometric_score"] + r["phrase_score"]) / 2
+            disagree += abs(r["llm_score"] - heuristic) > 0.35
+
+    pct = lambda n, d: round(n / d * 100, 2) if d else 0.0
     return jsonify({
-        "total_submissions": total_submissions,
-        "classifications": {
-            "likely_ai": ai_count,
-            "likely_human": human_count,
-            "uncertain": uncertain_count
-        },
-        "appeals_count": appeals_count,
-        "appeal_rate_percentage": appeal_rate,
-        "average_confidence_score": round(avg_confidence, 2)
+        "total_submissions": total,
+        "classifications": counts,
+        "appeals_count": appeals,
+        "appeal_rate_percentage": pct(appeals, total),
+        "average_confidence_score": round(sum(r["confidence"] for r in rows) / total, 2) if total else 0.0,
+        "confidence_histogram": buckets,
+        "verified_human_count": verified,
+        "llm_heuristic_disagreement_rate_percentage": pct(disagree, llm_rows),
+        "content_types": types,
     }), 200
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+DASHBOARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Provenance Guard Analytics</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#666;--card:#f4f5f7;--bar:#3b6fd4}
+@media (prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#eee;--muted:#999;--card:#22262b;--bar:#7aa2f7}}
+body{font:16px system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:760px;margin:0 auto;padding:24px 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.card{background:var(--card);border-radius:8px;padding:14px}.card b{display:block;font-size:26px}
+.card span{color:var(--muted);font-size:13px}h2{font-size:17px;margin:24px 0 8px}
+.row{display:flex;align-items:center;gap:8px;margin:4px 0}.row i{width:90px;font-style:normal;color:var(--muted);font-size:14px}
+.row div{background:var(--bar);height:16px;border-radius:3px;min-width:2px}.row em{font-style:normal;font-size:14px}
+</style></head><body><h1>Provenance Guard Analytics</h1><div id="app">Loading…</div>
+<script>
+fetch('/analytics/data').then(r=>r.json()).then(d=>{
+ const card=(v,l)=>`<div class="card"><b>${v}</b><span>${l}</span></div>`;
+ const bars=o=>{const m=Math.max(1,...Object.values(o));return Object.entries(o).map(([k,v])=>
+  `<div class="row"><i>${k}</i><div style="width:${v/m*100*0.6}%"></div><em>${v}</em></div>`).join('')};
+ document.getElementById('app').innerHTML=
+  `<div class="grid">${card(d.total_submissions,'submissions')}${card(d.appeal_rate_percentage+'%','appeal rate')}
+   ${card(d.average_confidence_score,'avg confidence')}${card(d.verified_human_count,'verified humans')}
+   ${card(d.llm_heuristic_disagreement_rate_percentage+'%','LLM vs heuristics disagree')}</div>
+   <h2>Classifications</h2>${bars(d.classifications)}
+   <h2>Confidence distribution</h2>${bars(d.confidence_histogram)}
+   <h2>Content types</h2>${bars(d.content_types)}`;
+});
+</script></body></html>"""
+
+@app.route("/analytics", methods=["GET"])
+def analytics_dashboard():
+    return DASHBOARD_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "service": "Provenance Guard API",
         "status": "online",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
-            "POST /submit": "Submit text content for multi-signal attribution analysis",
-            "POST /appeal": "Submit human review appeal for uncertain classifications",
-            "GET /log": "Fetch immutable provenance audit logs",
-            "GET /analytics/data": "Fetch platform classification aggregate metrics"
+            "POST /submit": "Submit text or an image description (+ optional image_metadata) for attribution",
+            "POST /appeal": "Appeal a classification",
+            "POST /verify/challenge": "Start the Verified Human challenge for a piece of content",
+            "POST /verify": "Submit the live writing sample to earn a certificate",
+            "GET /verify/<certificate_id>": "Validate a certificate",
+            "GET /content/<content_id>": "Public display view: label, appeal notice, badge",
+            "GET /log": "Recent audit log entries",
+            "GET /analytics/data": "Aggregate metrics (JSON)",
+            "GET /analytics": "Analytics dashboard (HTML)",
         }
     }), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5001, debug=True)
